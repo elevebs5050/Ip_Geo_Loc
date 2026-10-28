@@ -1,0 +1,139 @@
+document.addEventListener('DOMContentLoaded', () => {
+  const form = document.getElementById('lookup-form');
+  const ipInput = document.getElementById('ip-input');
+  const bulkInput = document.getElementById('bulk-input');
+  const bulkButton = document.getElementById('bulk-button');
+  const resultState = document.getElementById('result-state');
+  const resultContent = document.getElementById('result-content');
+
+  const renderHistory = (items) => {
+    const list = document.getElementById('history-list');
+    if (!list) return;
+
+    if (!items || items.length === 0) {
+      list.innerHTML = '<div class="history-item"><strong>No history yet</strong><span>Look up an IP to add records.</span></div>';
+      return;
+    }
+
+    list.innerHTML = items.slice(0, 6).map((item) => `
+      <div class="history-item">
+        <strong>${item.ip || 'Unknown IP'}</strong>
+        <span>${item.country || 'Unknown'} · ${item.city || 'Unknown city'}</span>
+      </div>
+    `).join('');
+  };
+
+  const loadHistory = async () => {
+    try {
+      const response = await fetch('/api/history');
+      const result = await response.json();
+      if (result.success) renderHistory(result.data);
+    } catch (error) {
+      // Ignore history load failures silently.
+    }
+  };
+
+  const setFields = (data) => {
+    const summary = data.summary || data;
+    document.getElementById('country-value').textContent = summary.country || 'N/A';
+    document.getElementById('region-value').textContent = summary.region || 'N/A';
+    document.getElementById('city-value').textContent = summary.city || 'N/A';
+    document.getElementById('isp-value').textContent = summary.isp || 'N/A';
+    document.getElementById('coords-value').textContent = summary.coordinates || 'N/A';
+    document.getElementById('confidence-value').textContent = data.confidence || 'Unknown';
+    document.getElementById('ip-value').textContent = data.ip || 'N/A';
+    document.getElementById('family-value').textContent = data.ip_family || 'N/A';
+    document.getElementById('asn-value').textContent = data.asn || 'N/A';
+    document.getElementById('timezone-value').textContent = data.timezone || 'N/A';
+    document.getElementById('proxy-value').textContent = data.proxy_risk || 'Unknown';
+    document.getElementById('private-value').textContent = data.is_private ? 'Yes' : 'No';
+    document.getElementById('reserved-value').textContent = data.is_reserved ? 'Yes' : 'No';
+    document.getElementById('score-value').textContent = `${data.accuracy_score || 0}%`;
+
+    const providerTable = document.getElementById('provider-table');
+    const providerEntries = data.providers || {};
+    const rows = ['<div class="provider-row header"><span>Provider</span><span>Country</span><span>Region</span><span>City</span><span>ISP</span></div>'];
+
+    Object.entries(providerEntries).forEach(([provider, providerData]) => {
+      if (providerData && !providerData.error) {
+        rows.push(`
+          <div class="provider-row">
+            <span>${provider}</span>
+            <span>${providerData.country || 'N/A'}</span>
+            <span>${providerData.region || 'N/A'}</span>
+            <span>${providerData.city || 'N/A'}</span>
+            <span>${providerData.isp || 'N/A'}</span>
+          </div>
+        `);
+      }
+    });
+
+    providerTable.innerHTML = rows.join('');
+    resultState.classList.add('hidden');
+    resultContent.classList.remove('hidden');
+    loadHistory();
+  };
+
+  const onLookupError = (message) => {
+    resultState.classList.remove('hidden');
+    resultContent.classList.add('hidden');
+    resultState.innerHTML = `<p>${message}</p>`;
+  };
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const ip = ipInput.value.trim();
+    if (!ip) {
+      onLookupError('Please enter an IP address.');
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/lookup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip })
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        onLookupError(result.error || 'Lookup failed.');
+        return;
+      }
+      setFields(result.data);
+    } catch (error) {
+      onLookupError('Could not reach the backend service.');
+    }
+  });
+
+  bulkButton.addEventListener('click', async () => {
+    const ips = bulkInput.value.trim();
+    if (!ips) {
+      onLookupError('Add one or more IPs to the bulk input area.');
+      return;
+    }
+
+    try {
+      const response = await fetch('/api/bulk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ips })
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        onLookupError(result.error || 'Bulk lookup failed.');
+        return;
+      }
+
+      const firstValid = result.data.find((item) => item && !item.error) || result.data[0];
+      if (firstValid) {
+        setFields(firstValid);
+      } else {
+        onLookupError('No valid results were returned.');
+      }
+    } catch (error) {
+      onLookupError('Bulk lookup could not complete.');
+    }
+  });
+
+  loadHistory();
+});

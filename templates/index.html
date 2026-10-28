@@ -1,0 +1,27 @@
+# GeoLens IP Intelligence
+
+A stronger IP geolocation dashboard with better location accuracy, provider comparison, risk scoring, and a cleaner interface.
+
+## Features
+- Single IP lookup with IPv4 and IPv6 validation
+- Multi-provider geolocation fallback
+- Accuracy score and confidence rating
+- Proxy/VPN/hosting risk detection
+- Bulk lookup for multiple IPs
+- Recent search history
+- CSV or JSON export
+- Modern responsive dark UI
+
+## Run locally
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+Open http://localhost:5000 in your browser.
+
+## Notes
+The app combines several public geolocation services and chooses the most consistent values to improve overall accuracy and provide a more reliable result.
