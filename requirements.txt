@@ -1,0 +1,378 @@
+from __future__ import annotations
+
+import csv
+import io
+import ipaddress
+import json
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
+
+import requests
+from flask import Flask, jsonify, render_template, request
+
+app = Flask(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+HISTORY_PATH = DATA_DIR / "history.json"
+DATA_DIR.mkdir(exist_ok=True)
+
+PROVIDER_TIMEOUT = 5
+MAX_HISTORY = 12
+
+
+def safe_get(mapping: Dict[str, Any], *keys: str) -> Any:
+    value: Any = mapping
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def read_history() -> List[Dict[str, Any]]:
+    if not HISTORY_PATH.exists():
+        return []
+    try:
+        with HISTORY_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def write_history(entries: List[Dict[str, Any]]) -> None:
+    with HISTORY_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(entries[:MAX_HISTORY], handle, indent=2)
+
+
+def normalize_value(value: Any) -> Any:
+    if value in (None, "", "Unknown", "N/A"):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return value
+
+
+def choose_best_value(values: Iterable[Any]) -> Any:
+    cleaned = []
+    for value in values:
+        normalized = normalize_value(value)
+        if normalized is not None:
+            cleaned.append(normalized)
+
+    if not cleaned:
+        return None
+
+    counts: Dict[str, int] = {}
+    for value in cleaned:
+        label = str(value)
+        counts[label] = counts.get(label, 0) + 1
+
+    best_value, best_count = max(counts.items(), key=lambda pair: (pair[1], len(pair[0])))
+    return best_value if best_count > 0 else None
+
+
+def rate_accuracy(fields: Dict[str, Any]) -> int:
+    completed = sum(
+        1
+        for key in ["country", "region", "city", "latitude", "longitude", "timezone", "isp", "asn"]
+        if normalize_value(fields.get(key)) is not None
+    )
+    score = int((completed / 8) * 100)
+    return max(35, min(100, score))
+
+
+def fetch_ipapi(ip: str) -> Dict[str, Any]:
+    response = requests.get(f"https://ipapi.co/{ip}/json/", timeout=PROVIDER_TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("error"):
+        raise ValueError(payload.get("reason") or "ipapi lookup failed")
+
+    return {
+        "provider": "ipapi",
+        "country": safe_get(payload, "country_name") or safe_get(payload, "country"),
+        "region": safe_get(payload, "region"),
+        "city": safe_get(payload, "city"),
+        "latitude": safe_get(payload, "latitude"),
+        "longitude": safe_get(payload, "longitude"),
+        "timezone": safe_get(payload, "timezone"),
+        "isp": safe_get(payload, "org"),
+        "asn": safe_get(payload, "asn"),
+        "country_code": safe_get(payload, "country_code"),
+        "proxy": bool(safe_get(payload, "proxy")),
+        "hosting": bool(safe_get(payload, "hosting")),
+    }
+
+
+def fetch_ipwho(ip: str) -> Dict[str, Any]:
+    response = requests.get(f"https://ipwho.is/{ip}?output=json", timeout=PROVIDER_TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("success", True):
+        raise ValueError(payload.get("message") or "ipwho lookup failed")
+
+    connection_type = safe_get(payload, "type")
+    return {
+        "provider": "ipwho",
+        "country": safe_get(payload, "country"),
+        "region": safe_get(payload, "region"),
+        "city": safe_get(payload, "city"),
+        "latitude": safe_get(payload, "latitude"),
+        "longitude": safe_get(payload, "longitude"),
+        "timezone": safe_get(payload, "timezone"),
+        "isp": safe_get(payload, "isp") or safe_get(payload, "connection"),
+        "asn": safe_get(payload, "asn"),
+        "country_code": safe_get(payload, "country_code"),
+        "proxy": bool(connection_type in {"hosting", "business", "proxy"}),
+        "hosting": bool(connection_type == "hosting"),
+    }
+
+
+def fetch_ip_api(ip: str) -> Dict[str, Any]:
+    response = requests.get(f"http://ip-api.com/json/{ip}", timeout=PROVIDER_TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("status") == "fail":
+        raise ValueError(payload.get("message") or "ip-api lookup failed")
+
+    return {
+        "provider": "ip-api",
+        "country": safe_get(payload, "country"),
+        "region": safe_get(payload, "regionName") or safe_get(payload, "region"),
+        "city": safe_get(payload, "city"),
+        "latitude": safe_get(payload, "lat"),
+        "longitude": safe_get(payload, "lon"),
+        "timezone": safe_get(payload, "timezone"),
+        "isp": safe_get(payload, "isp"),
+        "asn": safe_get(payload, "as"),
+        "country_code": safe_get(payload, "countryCode"),
+        "proxy": bool(safe_get(payload, "proxy") or safe_get(payload, "hosting")),
+        "hosting": bool(safe_get(payload, "hosting")),
+    }
+
+
+def fetch_provider_data(ip: str) -> Dict[str, Dict[str, Any]]:
+    providers = {
+        "ipapi": fetch_ipapi,
+        "ipwho": fetch_ipwho,
+        "ip-api": fetch_ip_api,
+    }
+    results: Dict[str, Dict[str, Any]] = {}
+    for name, fetcher in providers.items():
+        try:
+            provider_data = fetcher(ip)
+            results[name] = provider_data
+        except Exception:
+            results[name] = {"provider": name, "error": "unavailable"}
+    return results
+
+
+def classify_proxy_risk(proxy_flag: bool, hosting_flag: bool) -> str:
+    if proxy_flag:
+        return "High"
+    if hosting_flag:
+        return "Medium"
+    return "Low"
+
+
+def merge_provider_results(provider_data: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    chosen: Dict[str, Any] = {"providers": provider_data}
+    for field in ["country", "region", "city", "latitude", "longitude", "timezone", "isp", "asn", "country_code"]:
+        values = []
+        for item in provider_data.values():
+            if isinstance(item, dict) and "error" not in item:
+                values.append(item.get(field))
+        chosen[field] = choose_best_value(values)
+
+    proxy_flags = [bool(item.get("proxy")) for item in provider_data.values() if isinstance(item, dict) and "error" not in item]
+    hosting_flags = [bool(item.get("hosting")) for item in provider_data.values() if isinstance(item, dict) and "error" not in item]
+
+    chosen["proxy"] = any(proxy_flags)
+    chosen["hosting"] = any(hosting_flags)
+    chosen["proxy_risk"] = classify_proxy_risk(chosen["proxy"], chosen["hosting"])
+    chosen["accuracy_score"] = rate_accuracy(chosen)
+
+    if chosen["accuracy_score"] >= 80:
+        chosen["confidence"] = "High"
+    elif chosen["accuracy_score"] >= 55:
+        chosen["confidence"] = "Medium"
+    else:
+        chosen["confidence"] = "Low"
+
+    return chosen
+
+
+def geolocate_ip(ip_value: str) -> Dict[str, Any]:
+    ip_value = ip_value.strip()
+    if not ip_value:
+        raise ValueError("Please enter an IP address.")
+
+    try:
+        ip_obj = ipaddress.ip_address(ip_value)
+    except ValueError as exc:
+        raise ValueError("Please enter a valid IPv4 or IPv6 address.") from exc
+
+    provider_data = fetch_provider_data(str(ip_obj))
+    merged = merge_provider_results(provider_data)
+
+    merged["ip"] = str(ip_obj)
+    merged["ip_family"] = "IPv6" if ip_obj.version == 6 else "IPv4"
+    merged["is_private"] = ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local
+    merged["is_reserved"] = ip_obj.is_reserved
+
+    if merged.get("proxy"):
+        merged["notes"] = "This IP appears to be routed through a proxy, VPS, or hosting network."
+    elif merged.get("hosting"):
+        merged["notes"] = "This IP is associated with a hosting provider, which may affect location precision."
+    else:
+        merged["notes"] = "Location data looks broadly consistent across providers."
+
+    history = read_history()
+    merged_record = {
+        "ip": merged["ip"],
+        "country": merged.get("country"),
+        "region": merged.get("region"),
+        "city": merged.get("city"),
+        "latitude": merged.get("latitude"),
+        "longitude": merged.get("longitude"),
+        "timezone": merged.get("timezone"),
+        "isp": merged.get("isp"),
+        "asn": merged.get("asn"),
+        "proxy_risk": merged.get("proxy_risk"),
+        "accuracy_score": merged.get("accuracy_score"),
+        "confidence": merged.get("confidence"),
+        "providers": provider_data,
+    }
+
+    history.insert(0, merged_record)
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for item in history:
+        key = item.get("ip")
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    write_history(deduped)
+
+    merged["summary"] = {
+        "ip": merged["ip"],
+        "country": merged.get("country") or "N/A",
+        "region": merged.get("region") or "N/A",
+        "city": merged.get("city") or "N/A",
+        "coordinates": f"{merged.get('latitude')}, {merged.get('longitude')}" if merged.get("latitude") and merged.get("longitude") else "N/A",
+        "isp": merged.get("isp") or "N/A",
+        "asn": merged.get("asn") or "N/A",
+        "timezone": merged.get("timezone") or "N/A",
+        "proxy_risk": merged.get("proxy_risk", "Low"),
+        "accuracy_score": merged.get("accuracy_score", 0),
+    }
+    return merged
+
+
+def parse_bulk_ips(raw_data: str) -> List[str]:
+    ips: List[str] = []
+    for line in raw_data.replace(";", "\n").splitlines():
+        entry = line.strip()
+        if entry:
+            ips.append(entry)
+    return ips
+
+
+def export_csv(rows: List[Dict[str, Any]]) -> str:
+    fieldnames = [
+        "ip",
+        "country",
+        "region",
+        "city",
+        "latitude",
+        "longitude",
+        "timezone",
+        "isp",
+        "asn",
+        "proxy_risk",
+        "accuracy_score",
+        "confidence",
+    ]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({field: row.get(field, "") for field in fieldnames})
+    return buffer.getvalue()
+
+
+@app.get("/")
+def home():
+    return render_template("index.html", history=read_history())
+
+
+@app.post("/api/lookup")
+def api_lookup():
+    payload = request.get_json(silent=True) or {}
+    ip_value = str(payload.get("ip", "")).strip()
+    try:
+        result = geolocate_ip(ip_value)
+        return jsonify({"success": True, "data": result})
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+
+
+@app.post("/api/bulk")
+def api_bulk_lookup():
+    payload = request.get_json(silent=True) or {}
+    raw_ips = str(payload.get("ips", ""))
+    ips = parse_bulk_ips(raw_ips)
+    if not ips:
+        return jsonify({"success": False, "error": "No IP addresses were provided."}), 400
+
+    results: List[Dict[str, Any]] = []
+    for ip_value in ips:
+        try:
+            results.append(geolocate_ip(ip_value))
+        except ValueError:
+            results.append({"ip": ip_value, "error": "Invalid IP or lookup failure"})
+
+    return jsonify({"success": True, "data": results})
+
+
+@app.get("/api/history")
+def api_history():
+    return jsonify({"success": True, "data": read_history()})
+
+
+@app.get("/api/export")
+def api_export():
+    history = read_history()
+    export_format = request.args.get("format", "json").lower()
+
+    if export_format == "csv":
+        csv_content = export_csv([
+            {
+                "ip": item.get("ip", ""),
+                "country": item.get("country", ""),
+                "region": item.get("region", ""),
+                "city": item.get("city", ""),
+                "latitude": item.get("latitude", ""),
+                "longitude": item.get("longitude", ""),
+                "timezone": item.get("timezone", ""),
+                "isp": item.get("isp", ""),
+                "asn": item.get("asn", ""),
+                "proxy_risk": item.get("proxy_risk", ""),
+                "accuracy_score": item.get("accuracy_score", ""),
+                "confidence": item.get("confidence", ""),
+            }
+            for item in history
+        ])
+        response = app.response_class(csv_content, mimetype="text/csv")
+        response.headers["Content-Disposition"] = "attachment; filename=geo_history.csv"
+        return response
+
+    return jsonify({"success": True, "data": history})
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
+
